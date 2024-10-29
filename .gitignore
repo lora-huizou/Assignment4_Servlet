@@ -33,3 +33,5 @@ replay_pid*
 **/* 2.*
 *.2.xml
 *.2.jsp
+
+.DS_Store
