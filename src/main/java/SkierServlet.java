@@ -1,18 +1,73 @@
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.ConnectionFactory;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeoutException;
 import javax.servlet.*;
 import javax.servlet.http.*;
 import javax.servlet.annotation.*;
 import java.io.IOException;
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
+import lombok.extern.slf4j.Slf4j;
 import model.LiftRide;
+import model.LiftRideEvent;
 import model.ResponseMsg;
+import com.rabbitmq.client.Connection;
 
+@Slf4j
 @WebServlet(value = "/skiers/*")
 public class SkierServlet extends HttpServlet {
   private ResponseMsg responseMsg = new ResponseMsg();
   private Gson gson = new Gson();
+  private Connection connection;
+  private RMQChannelPool channelPool;
+  private static final String QUEUE_NAME = "LiftRideQueue";
+  private static final Integer CHANNEL_POOL_SIZE = 100;
+
+  private static final String HOST = "34.213.239.60"; // RabbitMQ server IP
+  //private static final String HOST = "localhost";
+
+  @Override
+  public void init() throws ServletException {
+    super.init();
+    // Initialize RabbitMQ connection
+    ConnectionFactory factory = new ConnectionFactory();
+    factory.setHost(HOST);
+    factory.setPort(5672);
+    factory.setUsername("guest");
+    factory.setPassword("guest");
+
+    try {
+      connection = factory.newConnection();
+      RMQChannelFactory channelFactory = new RMQChannelFactory(connection);
+      // init channel pool
+      channelPool = new RMQChannelPool(CHANNEL_POOL_SIZE, channelFactory);
+
+      // Declare the queue only once during initialization
+      try (Channel setupChannel = connection.createChannel()) {
+        setupChannel.queueDeclare(QUEUE_NAME, true, false, false, null);
+      }
+
+    } catch (IOException | TimeoutException e) {
+      throw new ServletException("Failed to establish RabbitMQ connection", e);
+    }
+  }
+  @Override
+  public void destroy() {
+    super.destroy();
+    try {
+      if (channelPool != null) {
+        channelPool.close();
+      }
+      if (connection != null && connection.isOpen()) {
+        connection.close();
+      }
+    } catch (IOException e) {
+      log.error("destroy error:{}", e.getMessage());
+    }
+  }
 
   @Override
   protected void doGet(HttpServletRequest req, HttpServletResponse res) throws ServletException, IOException {
@@ -49,6 +104,7 @@ public class SkierServlet extends HttpServlet {
   }
 
   protected void doPost(HttpServletRequest req, HttpServletResponse res) throws ServletException, IOException {
+    // {"resortID":12,"seasonID":"2019","dayID":1,"skierID":123,"liftRide":{"liftID":10,"time":277}}
     res.setContentType("application/json");
     String urlPath = req.getPathInfo();
 
@@ -77,7 +133,7 @@ public class SkierServlet extends HttpServlet {
         jsonBody.append(line);
       }
     }
-    LiftRide liftRide;
+    LiftRide liftRide = null;
     try {
       liftRide = gson.fromJson(jsonBody.toString(), LiftRide.class);
     } catch (JsonSyntaxException e) {
@@ -87,18 +143,45 @@ public class SkierServlet extends HttpServlet {
       return;
     }
 
-    if (liftRide.getLiftID() < 1 || liftRide.getLiftID() > 40 || liftRide.getTime() < 1 || liftRide.getTime() > 360) {
+    if (liftRide == null || liftRide.getLiftID() < 1 || liftRide.getLiftID() > 40 || liftRide.getTime() < 1 || liftRide.getTime() > 360) {
       res.setStatus(HttpServletResponse.SC_BAD_REQUEST);
       responseMsg.setMessage("Invalid LiftRide data");
       res.getWriter().write(gson.toJson(responseMsg));
       return;
     }
 
-    res.setStatus(HttpServletResponse.SC_CREATED);
-    responseMsg.setMessage("POST Request Processed Successfully!");
-    res.getWriter().write(gson.toJson(responseMsg));
-  }
+    int resortID = Integer.parseInt(urlParts[1]);
+    String seasonID = urlParts[3];
+    int dayID = Integer.parseInt(urlParts[5]);
+    int skierID = Integer.parseInt(urlParts[7]);
+    LiftRideEvent liftRideMessage = new LiftRideEvent(resortID, seasonID, dayID, skierID, liftRide);
 
+    Channel channel = null;
+    try {
+      channel = channelPool.borrowChannel();
+      // declare the queue
+      //channel.queueDeclare(QUEUE_NAME, true, false, false, null);
+      String message = gson.toJson(liftRideMessage);
+      // publish message to queue
+      channel.basicPublish("", QUEUE_NAME, null, message.getBytes(StandardCharsets.UTF_8));
+      // return success to client
+      res.setStatus(HttpServletResponse.SC_CREATED);
+      responseMsg.setMessage("POST Request Processed Successfully!");
+      res.getWriter().write(gson.toJson(responseMsg));
+    } catch (IOException e){
+      res.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+      responseMsg.setMessage("Failed to process request");
+      res.getWriter().write(gson.toJson(responseMsg));
+    } finally {
+      if (channel != null){
+        try {
+          channelPool.returnChannel(channel);
+        } catch (Exception e){
+          log.error("Error returning channel to pool: {}", e.getMessage());
+        }
+      }
+    }
+  }
   private boolean isUrlValid(String[] urlParts) {
     // given url : /skiers/{resortID}/seasons/{seasonID}/days/{dayID}/skiers/{skierID}
     // urlParts  = "/1/seasons/2019/day/1/skier/123"
