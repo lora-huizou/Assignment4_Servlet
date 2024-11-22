@@ -26,7 +26,7 @@ public class SkierServlet extends HttpServlet {
   private static final String QUEUE_NAME = "LiftRideQueue";
   private static final Integer CHANNEL_POOL_SIZE = 100;
 
-  private static final String HOST = "34.213.239.60"; // RabbitMQ server IP
+  private static final String HOST = "54.190.212.169"; // RabbitMQ server IP
   //private static final String HOST = "localhost";
 
   @Override
@@ -149,7 +149,7 @@ public class SkierServlet extends HttpServlet {
       res.getWriter().write(gson.toJson(responseMsg));
       return;
     }
-
+    //parse from url
     int resortID = Integer.parseInt(urlParts[1]);
     String seasonID = urlParts[3];
     int dayID = Integer.parseInt(urlParts[5]);
