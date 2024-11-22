@@ -1,2 +1,2 @@
-# 6650-A1-Server
+# 6650-Assignment-Server
 cs6650 assignment
