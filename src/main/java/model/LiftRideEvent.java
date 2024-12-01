@@ -6,10 +6,10 @@ import lombok.Data;
 @Data
 @AllArgsConstructor
 public class LiftRideEvent {
-  private int resortID;
+  private Integer resortID;
   private String seasonID;
-  private int dayID;
-  private int skierID;
+  private Integer dayID;
+  private Integer skierID;
   private LiftRide liftRide;
 
 }

@@ -15,9 +15,10 @@ import model.LiftRide;
 import model.LiftRideEvent;
 import model.ResponseMsg;
 import com.rabbitmq.client.Connection;
+import model.SkierVerticalResponse;
 
 @Slf4j
-@WebServlet(value = "/skiers/*")
+@WebServlet(value = {"/skiers/*", "/resorts/*"})
 public class SkierServlet extends HttpServlet {
   private ResponseMsg responseMsg = new ResponseMsg();
   private Gson gson = new Gson();
@@ -25,6 +26,8 @@ public class SkierServlet extends HttpServlet {
   private RMQChannelPool channelPool;
   private static final String QUEUE_NAME = "LiftRideQueue";
   private static final Integer CHANNEL_POOL_SIZE = 100;
+
+  private SkiResortDao dao;
 
   private static final String HOST = "54.190.212.169"; // RabbitMQ server IP
   //private static final String HOST = "localhost";
@@ -49,7 +52,9 @@ public class SkierServlet extends HttpServlet {
       try (Channel setupChannel = connection.createChannel()) {
         setupChannel.queueDeclare(QUEUE_NAME, true, false, false, null);
       }
-
+      // Initialize SkiResortDao
+      dao = new SkiResortDao();
+      log.info("SkiResortDao initialized successfully");
     } catch (IOException | TimeoutException e) {
       throw new ServletException("Failed to establish RabbitMQ connection", e);
     }
@@ -74,35 +79,42 @@ public class SkierServlet extends HttpServlet {
     res.setContentType("text/plain");
     String urlPath = req.getPathInfo();
 
-    // check we have a URL!
+    // Check if we have a URL
     if (urlPath == null || urlPath.isEmpty()) {
       res.setStatus(HttpServletResponse.SC_NOT_FOUND);
-      responseMsg.setMessage("Missing paramterers");
+      responseMsg.setMessage("Missing parameters");
       res.getWriter().write(gson.toJson(responseMsg));
       return;
     }
 
     String[] urlParts = urlPath.split("/");
-    // and now validate url path and return the response status code
-    // (and maybe also some value if input is valid)
-
-    if (!isUrlValid(urlParts)) {
-      res.setStatus(HttpServletResponse.SC_NOT_FOUND);
-      responseMsg.setMessage("Invalid url");
-      res.getWriter().write(gson.toJson(responseMsg));
-    } else {
-      // do any sophisticated processing with urlParts which contains all the url params
-      int resortID = Integer.parseInt(urlParts[1]);
-      String seasonID = urlParts[3];
-      String dayID = urlParts[5];
-      int skierID = Integer.parseInt(urlParts[7]);
-      responseMsg.setMessage(String.format("Lift ride value get successfully for, "
-          + "resortID %d, seasonID %s, dayID %s, skierID %d",resortID, seasonID, dayID, skierID ));
-      res.getWriter().write(gson.toJson(responseMsg));
-      res.setStatus(HttpServletResponse.SC_OK);
+    try {
+      // GET /resorts/{resortID}/seasons/{seasonID}/day/{dayID}/skiers
+      //          ["", "1", "seasons", "2024", "day", "1", "skiers"]
+      if (urlParts.length == 7 && urlParts[0].equals("") && urlParts[2].equals("seasons") && urlParts[4].equals("day") && urlParts[6].equals("skiers") ) {
+        handleGetUniqueSkiers(req, res, urlParts);
+      } else if (urlParts.length == 8 && urlParts[2].equals("seasons") && urlParts[4].equals("days") && urlParts[6].equals("skiers")) {
+        // GET /skiers/{resortID}/seasons/{seasonID}/days/{dayID}/skiers/{skierID}
+        handleGetSkierDayVertical(req, res, urlParts);
+      } else if (urlParts.length == 3 && urlParts[0].equals("") && urlParts[2].equals("vertical")) {
+        // GET /skiers/{skierID}/vertical
+        handleGetTotalVertical(req, res, urlParts);
+      } else {
+        res.setStatus(HttpServletResponse.SC_NOT_FOUND);
+        responseMsg.setMessage("Invalid URL");
+        res.getWriter().write(gson.toJson(responseMsg));
+      }
+    } catch (NumberFormatException e) {
+      sendErrorResponse(res, HttpServletResponse.SC_BAD_REQUEST, "Invalid numerical parameter");
+    } catch (IllegalArgumentException e) {
+      sendErrorResponse(res, HttpServletResponse.SC_BAD_REQUEST, e.getMessage());
+    } catch (Exception e) {
+      sendErrorResponse(res, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Server error: " + e.getMessage());
+      log.error("Error processing GET request", e);
     }
   }
 
+  @Override
   protected void doPost(HttpServletRequest req, HttpServletResponse res) throws ServletException, IOException {
     // {"resortID":12,"seasonID":"2019","dayID":1,"skierID":123,"liftRide":{"liftID":10,"time":277}}
     res.setContentType("application/json");
@@ -218,6 +230,50 @@ public class SkierServlet extends HttpServlet {
       return false;
     }
     return true;
+  }
+
+  private void handleGetUniqueSkiers(HttpServletRequest req, HttpServletResponse res, String[] urlParts) throws IOException {
+    // GET /resorts/{resortID}/seasons/{seasonID}/day/{dayID}/skiers
+    int resortID = Integer.parseInt(urlParts[1]);
+    String seasonID = urlParts[3];
+    int dayID = Integer.parseInt(urlParts[5]);
+    int uniqueSkiers = dao.getUniqueSkiers(resortID, seasonID, dayID);
+    responseMsg.setMessage("Unique skiers: " + uniqueSkiers);
+    sendJsonResponse(res, HttpServletResponse.SC_OK, responseMsg);
+  }
+
+  private void handleGetSkierDayVertical(HttpServletRequest req, HttpServletResponse res, String[] urlParts) throws IOException {
+    //GET /skiers/{resortID}/seasons/{seasonID}/days/{dayID}/skiers/{skierID}
+    int resortID = Integer.parseInt(urlParts[1]);
+    String seasonID = urlParts[3];
+    int dayID = Integer.parseInt(urlParts[5]);
+    int skierID = Integer.parseInt(urlParts[7]);
+    int totalVertical = dao.getSkierDayVertical(skierID, seasonID, dayID, resortID);
+    responseMsg.setMessage("Total vertical: " + totalVertical);
+    sendJsonResponse(res, HttpServletResponse.SC_OK, responseMsg);
+  }
+
+  private void handleGetTotalVertical(HttpServletRequest req, HttpServletResponse res, String[] urlParts) throws IOException {
+    //GET /skiers/{skierID}/vertical
+    int skierID = Integer.parseInt(urlParts[1]);
+    String resort = req.getParameter("resort");
+    String season = req.getParameter("season");
+
+    if (resort == null || resort.isEmpty()) {
+      throw new IllegalArgumentException("Missing required parameter: resort");
+    }
+    SkierVerticalResponse skierVerticalResponse = dao.getTotalVertical(skierID, resort, season);
+    sendJsonResponse(res, HttpServletResponse.SC_OK, skierVerticalResponse);
+  }
+
+  private void sendErrorResponse(HttpServletResponse res, int statusCode, String message) throws IOException {
+    res.setStatus(statusCode);
+    responseMsg.setMessage(message);
+    res.getWriter().write(gson.toJson(responseMsg));
+  }
+  private void sendJsonResponse(HttpServletResponse res, int statusCode, Object response) throws IOException {
+    res.setStatus(statusCode);
+    res.getWriter().write(gson.toJson(response));
   }
 
 }
