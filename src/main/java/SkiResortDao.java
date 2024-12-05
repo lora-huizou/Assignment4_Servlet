@@ -41,6 +41,7 @@ public class SkiResortDao {
   private static final int TOTAL_SHARDS = 100;
   private LoadingCache<String, Integer> uniqueSkiersCache;
   private LoadingCache<String, Integer> skierDayVerticalCache;
+  private LoadingCache<String, SkierVerticalResponse> skierVerticalCache;
 
 
   public SkiResortDao() {
@@ -66,6 +67,16 @@ public class SkiResortDao {
           @Override
           public Integer load(String key) throws Exception {
             return loadSkierDayVerticalFromDatabase(key);
+          }
+        });
+
+    skierVerticalCache = CacheBuilder.newBuilder()
+        .maximumSize(100) // Maximum cache size
+        .expireAfterWrite(10, TimeUnit.MINUTES) // Cache expiry
+        .build(new CacheLoader<String, SkierVerticalResponse>() {
+          @Override
+          public SkierVerticalResponse load(String key) throws Exception {
+            return loadSkierVerticalFromDatabase(key);
           }
         });
   }
@@ -328,11 +339,28 @@ public class SkiResortDao {
 
   // Query 3: Get the total vertical for the skier the specified resort. If no season is specified, return all seasons
   // GET/skiers/{skierID}/vertical
-
   public SkierVerticalResponse getTotalVertical(int skierID, String resort, String season) {
     if (resort == null || resort.isEmpty()) {
       throw new IllegalArgumentException("Resort is a required parameter");
     }
+
+    String cacheKey = (season != null && !season.isEmpty())
+        ? String.format("totalVertical:%d:%s:%s", skierID, resort, season)
+        : String.format("totalVertical:%d:%s:all", skierID, resort);
+
+    try {
+      // Use cache to get the response
+      return skierVerticalCache.get(cacheKey);
+    } catch (ExecutionException e) {
+      log.error("Error loading skier vertical from cache: {}", e.getMessage());
+      throw new RuntimeException("Failed to fetch skier vertical", e);
+    }
+  }
+  private SkierVerticalResponse loadSkierVerticalFromDatabase(String key) {
+    String[] parts = key.split(":");
+    int skierID = Integer.parseInt(parts[1]);
+    String resort = parts[2];
+    String season = parts.length == 4 ? parts[3] : null;
 
     Map<String, String> expressionAttributeNames = new HashMap<>();
     expressionAttributeNames.put("#partitionKey", PARTITION_KEY); // "skierID"
@@ -346,7 +374,7 @@ public class SkiResortDao {
     List<SkierVerticalResponse.SeasonVertical> seasonVerticals = new ArrayList<>();
 
     if (season != null && !season.isEmpty()) {
-      // When season is specified
+      // Query for a specific season
       String sortKey = resort + "#" + season;
       expressionAttributeValues.put(":sortKey", AttributeValue.builder().s(sortKey).build());
       keyConditionExpression += " AND #gsi3SortKey = :sortKey";
@@ -369,7 +397,7 @@ public class SkiResortDao {
       seasonVerticals.add(new SkierVerticalResponse.SeasonVertical(season, totalVertical));
 
     } else {
-      // When season is not specified, aggregate total verticals per season
+      // Query for all seasons
       String sortKeyPrefix = resort + "#";
       expressionAttributeValues.put(":sortKeyPrefix", AttributeValue.builder().s(sortKeyPrefix).build());
       keyConditionExpression += " AND begins_with(#gsi3SortKey, :sortKeyPrefix)";
@@ -387,11 +415,9 @@ public class SkiResortDao {
 
       // Group by seasonID and sum verticals
       Map<String, Integer> seasonTotals = new HashMap<>();
-
       for (Map<String, AttributeValue> item : response.items()) {
         String seasonID = item.get("seasonID").s();
         int vertical = Integer.parseInt(item.get("vertical").n());
-
         seasonTotals.put(seasonID, seasonTotals.getOrDefault(seasonID, 0) + vertical);
       }
 
