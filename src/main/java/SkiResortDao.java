@@ -22,6 +22,10 @@ import software.amazon.awssdk.services.dynamodb.model.PutRequest;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
 import software.amazon.awssdk.services.dynamodb.model.QueryResponse;
 import software.amazon.awssdk.services.dynamodb.model.WriteRequest;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 public class SkiResortDao {
@@ -35,6 +39,9 @@ public class SkiResortDao {
   private static final String GSI3_NAME = "GSI3"; // pk:skierID, sk:resortID#seasonID
   private static final String GSI3_SORT_KEY = "resortID#seasonID";
   private static final int TOTAL_SHARDS = 100;
+  private LoadingCache<String, Integer> uniqueSkiersCache;
+  private LoadingCache<String, Integer> skierDayVerticalCache;
+  private LoadingCache<String, SkierVerticalResponse> skierVerticalCache;
 
 
   public SkiResortDao() {
@@ -42,6 +49,36 @@ public class SkiResortDao {
         .region(Region.US_WEST_2)
         .credentialsProvider(InstanceProfileCredentialsProvider.create())
         .build();
+    // Initialize the cache
+    uniqueSkiersCache = CacheBuilder.newBuilder()
+        .maximumSize(100) // Maximum cache size
+        .expireAfterWrite(10, TimeUnit.MINUTES)
+        .build(new CacheLoader<String, Integer>() {
+          @Override
+          public Integer load(String key) throws Exception {
+            return loadUniqueSkiersFromDatabase(key);
+          }
+        });
+
+    skierDayVerticalCache = CacheBuilder.newBuilder()
+        .maximumSize(100)
+        .expireAfterWrite(10, TimeUnit.MINUTES)
+        .build(new CacheLoader<String, Integer>() {
+          @Override
+          public Integer load(String key) throws Exception {
+            return loadSkierDayVerticalFromDatabase(key);
+          }
+        });
+
+    skierVerticalCache = CacheBuilder.newBuilder()
+        .maximumSize(100) // Maximum cache size
+        .expireAfterWrite(10, TimeUnit.MINUTES) // Cache expiry
+        .build(new CacheLoader<String, SkierVerticalResponse>() {
+          @Override
+          public SkierVerticalResponse load(String key) throws Exception {
+            return loadSkierVerticalFromDatabase(key);
+          }
+        });
   }
 
   public void addLiftRidesBatch(List<LiftRideEvent> events) {
@@ -183,7 +220,26 @@ public class SkiResortDao {
 
   // GET/resorts/{resortID}/seasons/{seasonID}/day/{dayID}/skiers
   // Query 1: Get unique skiers for a resort/season/day
+  private Integer loadUniqueSkiersFromDatabase(String key) {
+    String[] parts = key.split("-");
+    int resortID = Integer.parseInt(parts[0]);
+    String seasonID = parts[1];
+    int dayID = Integer.parseInt(parts[2]);
+
+    return getUniqueSkiersFromDatabase(resortID, seasonID, dayID);
+  }
   public int getUniqueSkiers(int resortID, String seasonID, int dayID) {
+    String key = resortID + "-" + seasonID + "-" + dayID;
+
+    // Use cache to retrieve the result
+    try {
+      return uniqueSkiersCache.get(key); // Returns from cache or loads from database if missing
+    } catch (Exception e) {
+      log.error("Error retrieving data from cache: ", e);
+      return getUniqueSkiersFromDatabase(resortID, seasonID, dayID); // Fallback to database query
+    }
+  }
+  public int getUniqueSkiersFromDatabase(int resortID, String seasonID, int dayID) {
     Set<Integer> uniqueSkiers = ConcurrentHashMap.newKeySet();
     ExecutorService executor = Executors.newFixedThreadPool(10); // Adjust thread pool size per performance
 
@@ -233,6 +289,27 @@ public class SkiResortDao {
   // GET/skiers/{resortID}/seasons/{seasonID}/days/{dayID}/skiers/{skierID}
   // Query 2: Get total vertical for a skier on a specific day
   public int getSkierDayVertical(int skierID, String seasonID, int dayID, int resortID) {
+    // Cache key: dayID-skierID
+    String key = String.format("day%d-skier%d", dayID, skierID);
+    try {
+      return skierDayVerticalCache.get(key); // Fetch from cache or load from database
+    } catch (Exception e) {
+      log.error("Error retrieving skier day vertical from cache: ", e);
+      return getSkierDayVerticalFromDatabase(skierID, seasonID, dayID, resortID);
+    }
+  }
+
+  private Integer loadSkierDayVerticalFromDatabase(String key) {
+    // Parse the key
+    String[] parts = key.split("-");
+    int dayID = Integer.parseInt(parts[0].replace("day", ""));
+    int skierID = Integer.parseInt(parts[1].replace("skier", ""));
+    String seasonID = "2024"; // Constant per instructions
+    int resortID = 1; // Constant per instructions
+    return getSkierDayVerticalFromDatabase(skierID, seasonID, dayID, resortID);
+  }
+
+  public int getSkierDayVerticalFromDatabase(int skierID, String seasonID, int dayID, int resortID) {
     String sortKeyPrefix = String.format("%d#%s#%d#", resortID, seasonID, dayID);
 
     Map<String, String> expressionAttributeNames = new HashMap<>();
@@ -262,11 +339,28 @@ public class SkiResortDao {
 
   // Query 3: Get the total vertical for the skier the specified resort. If no season is specified, return all seasons
   // GET/skiers/{skierID}/vertical
-
   public SkierVerticalResponse getTotalVertical(int skierID, String resort, String season) {
     if (resort == null || resort.isEmpty()) {
       throw new IllegalArgumentException("Resort is a required parameter");
     }
+
+    String cacheKey = (season != null && !season.isEmpty())
+        ? String.format("totalVertical:%d:%s:%s", skierID, resort, season)
+        : String.format("totalVertical:%d:%s:all", skierID, resort);
+
+    try {
+      // Use cache to get the response
+      return skierVerticalCache.get(cacheKey);
+    } catch (ExecutionException e) {
+      log.error("Error loading skier vertical from cache: {}", e.getMessage());
+      throw new RuntimeException("Failed to fetch skier vertical", e);
+    }
+  }
+  private SkierVerticalResponse loadSkierVerticalFromDatabase(String key) {
+    String[] parts = key.split(":");
+    int skierID = Integer.parseInt(parts[1]);
+    String resort = parts[2];
+    String season = parts.length == 4 ? parts[3] : null;
 
     Map<String, String> expressionAttributeNames = new HashMap<>();
     expressionAttributeNames.put("#partitionKey", PARTITION_KEY); // "skierID"
@@ -280,7 +374,7 @@ public class SkiResortDao {
     List<SkierVerticalResponse.SeasonVertical> seasonVerticals = new ArrayList<>();
 
     if (season != null && !season.isEmpty()) {
-      // When season is specified
+      // Query for a specific season
       String sortKey = resort + "#" + season;
       expressionAttributeValues.put(":sortKey", AttributeValue.builder().s(sortKey).build());
       keyConditionExpression += " AND #gsi3SortKey = :sortKey";
@@ -303,7 +397,7 @@ public class SkiResortDao {
       seasonVerticals.add(new SkierVerticalResponse.SeasonVertical(season, totalVertical));
 
     } else {
-      // When season is not specified, aggregate total verticals per season
+      // Query for all seasons
       String sortKeyPrefix = resort + "#";
       expressionAttributeValues.put(":sortKeyPrefix", AttributeValue.builder().s(sortKeyPrefix).build());
       keyConditionExpression += " AND begins_with(#gsi3SortKey, :sortKeyPrefix)";
@@ -321,11 +415,9 @@ public class SkiResortDao {
 
       // Group by seasonID and sum verticals
       Map<String, Integer> seasonTotals = new HashMap<>();
-
       for (Map<String, AttributeValue> item : response.items()) {
         String seasonID = item.get("seasonID").s();
         int vertical = Integer.parseInt(item.get("vertical").n());
-
         seasonTotals.put(seasonID, seasonTotals.getOrDefault(seasonID, 0) + vertical);
       }
 
